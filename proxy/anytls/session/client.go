@@ -74,34 +74,50 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	}
 
 	// When the stream closes, return the session to the idle pool.
+	// sync.Once prevents double-close from triggering pool logic twice.
+	// InIdle CAS prevents the same session from appearing in the pool
+	// more than once (guards against future multi-stream-per-session use).
+	var closeOnce sync.Once
 	stream.CloseFunc = func() error {
-		err := stream.CloseRemote()
-		if !sess.IsClosed() {
-			select {
-			case <-c.ctx.Done():
-				go sess.Close()
-			default:
-				c.idleLock.Lock()
-				sess.IdleSince = time.Now()
-				c.idleSessions = append(c.idleSessions, sess)
-				c.idleLock.Unlock()
+		var err error
+		closeOnce.Do(func() {
+			err = stream.CloseRemote()
+			if !sess.IsClosed() {
+				select {
+				case <-c.ctx.Done():
+					go sess.Close()
+				default:
+					c.returnToIdle(sess)
+				}
 			}
-		}
+		})
 		return err
 	}
 
 	return stream, nil
 }
 
+// returnToIdle puts a session back into the idle pool.
+// Uses InIdle CAS to guarantee a session appears at most once.
+func (c *Client) returnToIdle(sess *Session) {
+	if !sess.InIdle.CompareAndSwap(false, true) {
+		return // already in pool
+	}
+	c.idleLock.Lock()
+	sess.IdleSince = time.Now()
+	c.idleSessions = append(c.idleSessions, sess)
+	c.idleLock.Unlock()
+}
+
 func (c *Client) getIdleSession() *Session {
 	c.idleLock.Lock()
 	defer c.idleLock.Unlock()
 
-	// Reuse the newest idle session (last in slice).
 	for len(c.idleSessions) > 0 {
 		n := len(c.idleSessions)
 		sess := c.idleSessions[n-1]
 		c.idleSessions = c.idleSessions[:n-1]
+		sess.InIdle.Store(false)
 		if !sess.IsClosed() {
 			return sess
 		}
@@ -118,6 +134,8 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	sess := NewClientSession(conn)
 	sess.Seq = c.sessionCounter.Add(1)
 	sess.DieHook = func() {
+		sess.InIdle.Store(false)
+
 		c.idleLock.Lock()
 		for i, s := range c.idleSessions {
 			if s == sess {
@@ -179,9 +197,11 @@ func (c *Client) idleCleanup() {
 	remaining := c.idleSessions[:0]
 	for _, sess := range c.idleSessions {
 		if sess.IsClosed() {
+			sess.InIdle.Store(false)
 			continue
 		}
 		if sess.IdleSince.Before(expTime) {
+			sess.InIdle.Store(false)
 			toClose = append(toClose, sess)
 		} else {
 			remaining = append(remaining, sess)

@@ -2,6 +2,7 @@ package session
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,6 +17,7 @@ import (
 
 const protocolVersion = "2"
 const clientName = "anytls/0.0.11"
+const synackTimeout = 3 * time.Second
 
 // Session multiplexes streams over a single connection.
 type Session struct {
@@ -33,10 +35,12 @@ type Session struct {
 	// pool fields
 	Seq       uint64
 	IdleSince time.Time
+	InIdle    atomic.Bool // true while session is in the idle pool
 
-	peerVersion byte
+	peerVersion atomic.Uint32
 
-	// buffering: buffer initial frames until first stream opens
+	// buffering: buffer initial frames until first stream opens.
+	// Protected by connLock (read in writeConn, written in flushBuffering).
 	buffering bool
 	buffer    []byte
 }
@@ -86,7 +90,7 @@ func (s *Session) Close() error {
 		}
 		s.streamLock.Lock()
 		for _, stream := range s.streams {
-			stream.closeLocally()
+			stream.forceClose()
 		}
 		s.streams = make(map[uint32]*Stream)
 		s.streamLock.Unlock()
@@ -105,20 +109,59 @@ func (s *Session) OpenStream() (*Stream, error) {
 	stream := newStream(sid, s)
 
 	if _, err := s.writeControlFrame(newFrame(cmdSYN, sid)); err != nil {
+		stream.closePipe()
 		return nil, err
 	}
 
-	s.buffering = false
+	// Disable buffering under connLock so writeConn sees a consistent value.
+	s.flushBuffering()
 
+	// Register the stream.
 	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
 	select {
 	case <-s.die:
+		s.streamLock.Unlock()
+		stream.closePipe()
 		return nil, io.ErrClosedPipe
 	default:
 		s.streams[sid] = stream
-		return stream, nil
 	}
+	s.streamLock.Unlock()
+
+	// For protocol v2 (not the first stream), wait for SYNACK.
+	// First stream (sid==1): peerVersion is still 0 because cmdServerSettings
+	// hasn't arrived yet — we skip the wait, matching the reference impl.
+	if sid >= 2 && s.peerVersion.Load() >= 2 {
+		select {
+		case err := <-stream.synDone:
+			if err != nil {
+				s.streamLock.Lock()
+				delete(s.streams, sid)
+				s.streamLock.Unlock()
+				stream.forceClose()
+				return nil, err
+			}
+		case <-time.After(synackTimeout):
+			s.streamLock.Lock()
+			delete(s.streams, sid)
+			s.streamLock.Unlock()
+			stream.forceClose()
+			return nil, errors.New("[anytls] stream open timeout: no SYNACK received")
+		case <-s.die:
+			// Session died while waiting; stream already force-closed by Session.Close.
+			return nil, io.ErrClosedPipe
+		}
+	}
+
+	return stream, nil
+}
+
+// flushBuffering disables the buffering flag under connLock.
+// The next writeConn call will flush any accumulated buffer.
+func (s *Session) flushBuffering() {
+	s.connLock.Lock()
+	s.buffering = false
+	s.connLock.Unlock()
 }
 
 func (s *Session) recvLoop() {
@@ -140,15 +183,25 @@ func (s *Session) recvLoop() {
 		switch hdr.Cmd() {
 		case cmdPSH:
 			if dataLen > 0 {
-				buf := make([]byte, dataLen)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
+				data := make([]byte, dataLen)
+				if _, err := io.ReadFull(s.conn, data); err != nil {
 					return
 				}
 				s.streamLock.RLock()
 				stream, ok := s.streams[sid]
 				s.streamLock.RUnlock()
-				if ok {
-					stream.pw.Write(buf)
+				if !ok {
+					break
+				}
+				if !stream.enqueue(data) {
+					// Backpressure: reader not consuming, queue full.
+					// Close stream with io.EOF (not ErrClosedPipe) so the
+					// forwarder health counter is not penalised.
+					s.streamLock.Lock()
+					delete(s.streams, sid)
+					s.streamLock.Unlock()
+					stream.overflowClose()
+					s.writeControlFrame(newFrame(cmdFIN, sid))
 				}
 			}
 
@@ -162,58 +215,71 @@ func (s *Session) recvLoop() {
 			}
 
 		case cmdSYNACK:
+			// Always consume body bytes to keep framing in sync.
+			var data []byte
 			if dataLen > 0 {
-				buf := make([]byte, dataLen)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
+				data = make([]byte, dataLen)
+				if _, err := io.ReadFull(s.conn, data); err != nil {
 					return
 				}
-				// non-empty SYNACK means handshake failure
-				s.streamLock.RLock()
-				stream, ok := s.streams[sid]
-				s.streamLock.RUnlock()
-				if ok {
-					stream.dieErr = fmt.Errorf("remote: %s", string(buf))
-					stream.pr.CloseWithError(stream.dieErr)
+			}
+			s.streamLock.RLock()
+			stream, ok := s.streams[sid]
+			s.streamLock.RUnlock()
+			if !ok {
+				break // stream already gone (e.g. timed out)
+			}
+			if len(data) > 0 {
+				// Non-empty SYNACK = handshake failure.
+				synErr := fmt.Errorf("remote: %s", string(data))
+				select {
+				case stream.synDone <- synErr:
+					// OpenStream is waiting — it will clean up.
+				default:
+					// Nobody waiting (first stream / v1 peer).
+					stream.closed.Store(true)
+					stream.pw.CloseWithError(synErr)
+				}
+			} else {
+				// Empty SYNACK = success.
+				select {
+				case stream.synDone <- nil:
+				default:
 				}
 			}
 
 		case cmdWaste:
 			if dataLen > 0 {
-				buf := make([]byte, dataLen)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
+				if _, err := io.ReadFull(s.conn, make([]byte, dataLen)); err != nil {
 					return
 				}
-				// discard
 			}
 
 		case cmdAlert:
 			if dataLen > 0 {
-				buf := make([]byte, dataLen)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
+				data := make([]byte, dataLen)
+				if _, err := io.ReadFull(s.conn, data); err != nil {
 					return
 				}
-				log.F("[anytls] alert from server: %s", string(buf))
+				log.F("[anytls] alert from server: %s", string(data))
 				return
 			}
 
 		case cmdServerSettings:
 			if dataLen > 0 {
-				buf := make([]byte, dataLen)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
+				data := make([]byte, dataLen)
+				if _, err := io.ReadFull(s.conn, data); err != nil {
 					return
 				}
-				m := parseStringMap(string(buf))
+				m := parseStringMap(string(data))
 				if v, err := strconv.Atoi(m["v"]); err == nil {
-					s.peerVersion = byte(v)
+					s.peerVersion.Store(uint32(v))
 				}
 			}
 
 		case cmdUpdatePaddingScheme:
-			// We don't implement dynamic padding updates for simplicity;
-			// just consume the data.
 			if dataLen > 0 {
-				buf := make([]byte, dataLen)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
+				if _, err := io.ReadFull(s.conn, make([]byte, dataLen)); err != nil {
 					return
 				}
 			}
@@ -224,20 +290,9 @@ func (s *Session) recvLoop() {
 		case cmdHeartResponse:
 			// no-op
 
-		case cmdSettings:
-			// Server shouldn't send this to client, but consume anyway
-			if dataLen > 0 {
-				buf := make([]byte, dataLen)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
-					return
-				}
-			}
-
 		default:
-			// Unknown command: consume data
 			if dataLen > 0 {
-				buf := make([]byte, dataLen)
-				if _, err := io.ReadFull(s.conn, buf); err != nil {
+				if _, err := io.ReadFull(s.conn, make([]byte, dataLen)); err != nil {
 					return
 				}
 			}
@@ -289,6 +344,10 @@ func (s *Session) writeControlFrame(f frame) (int, error) {
 	return dataLen, nil
 }
 
+// writeConn writes to the underlying connection.  While buffering is true,
+// bytes are accumulated in memory; once buffering is set to false (by
+// flushBuffering under connLock), the accumulated buffer is flushed with
+// the first real write.
 func (s *Session) writeConn(b []byte) (int, error) {
 	s.connLock.Lock()
 	defer s.connLock.Unlock()
