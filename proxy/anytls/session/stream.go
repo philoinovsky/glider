@@ -36,6 +36,11 @@ type Stream struct {
 	dieOnce     sync.Once
 	CloseFunc   func() error // overridable close hook (set by Client)
 
+	// dataMu serialises close(dataCh) with the non-blocking send in enqueue,
+	// preventing a send-on-closed-channel panic and the corresponding data
+	// race that the race detector flags.
+	dataMu sync.Mutex
+
 	readTimerMu sync.Mutex
 	readTimer   *time.Timer
 }
@@ -82,9 +87,18 @@ func (s *Stream) writeLoop() {
 // enqueue is called by recvLoop (single goroutine — no concurrent callers).
 // Returns false if either the channel is full (frame-count limit) or the
 // byte budget is exceeded; the caller should close the stream.
+//
+// dataMu is held across the closed check and the channel send to prevent
+// a race with close(dataCh) in the various close methods.  The send is
+// non-blocking (select with default) so the mutex is never held long.
 func (s *Stream) enqueue(data []byte) bool {
 	n := int64(len(data))
 	if s.queuedBytes.Load()+n > dataQueueMaxBytes {
+		return false
+	}
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	if s.closed.Load() {
 		return false
 	}
 	select {
@@ -94,6 +108,15 @@ func (s *Stream) enqueue(data []byte) bool {
 	default:
 		return false
 	}
+}
+
+// closeDataCh marks the stream closed and closes dataCh under dataMu,
+// preventing a race with the non-blocking send in enqueue.
+func (s *Stream) closeDataCh() {
+	s.dataMu.Lock()
+	s.closed.Store(true)
+	close(s.dataCh)
+	s.dataMu.Unlock()
 }
 
 func (s *Stream) Read(b []byte) (int, error) {
@@ -118,10 +141,12 @@ func (s *Stream) Close() error {
 func (s *Stream) CloseRemote() error {
 	var once bool
 	s.dieOnce.Do(func() {
-		s.closed.Store(true)
-		close(s.dataCh) // writeLoop drains remaining, then pw.Close → EOF
+		s.closeDataCh() // writeLoop drains remaining, then pw.Close → EOF
 		once = true
 	})
+	// Unblock writeLoop if it is stuck in pw.Write (reader stopped reading).
+	// pw.Close is idempotent and concurrent-safe; the reader sees io.EOF.
+	s.pw.Close()
 	if once {
 		return s.sess.streamClosed(s.id)
 	}
@@ -132,8 +157,7 @@ func (s *Stream) CloseRemote() error {
 // Remaining buffered data is drained to the reader before io.EOF.
 func (s *Stream) closeLocally() {
 	s.dieOnce.Do(func() {
-		s.closed.Store(true)
-		close(s.dataCh)
+		s.closeDataCh()
 	})
 }
 
@@ -149,9 +173,8 @@ func (s *Stream) closeLocally() {
 // the stored error is always io.EOF regardless of call count.
 func (s *Stream) overflowClose() {
 	s.dieOnce.Do(func() {
-		s.closed.Store(true)
 		close(s.done)
-		close(s.dataCh)
+		s.closeDataCh()
 	})
 	s.pw.Close() // unblock stuck pw.Write; reader sees io.EOF
 }
@@ -161,9 +184,8 @@ func (s *Stream) overflowClose() {
 // io.ErrClosedPipe, which is appropriate: session death IS a real error.
 func (s *Stream) forceClose() {
 	s.dieOnce.Do(func() {
-		s.closed.Store(true)
 		close(s.done)
-		close(s.dataCh)
+		s.closeDataCh()
 	})
 	s.pr.Close() // unblock stuck pw.Write AND make Read return ErrClosedPipe
 }
@@ -172,9 +194,8 @@ func (s *Stream) forceClose() {
 // OpenStream raced with session close).
 func (s *Stream) closePipe() {
 	s.dieOnce.Do(func() {
-		s.closed.Store(true)
 		close(s.done)
-		close(s.dataCh)
+		s.closeDataCh()
 	})
 }
 
