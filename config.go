@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"path"
@@ -12,8 +13,6 @@ import (
 	"github.com/nadoo/glider/proxy"
 	"github.com/nadoo/glider/rule"
 )
-
-var flag = conflag.New()
 
 // Config is global config struct.
 type Config struct {
@@ -36,136 +35,151 @@ type Config struct {
 	rules []*rule.Config
 
 	Services []string
+
+	// helpScheme / helpExample are CLI help-text intents. parseConfig parses
+	// them but does not act on them; the caller (main.go startup) checks and
+	// exits with help output. SIGHUP reload ignores them entirely so that a
+	// stray "scheme=" line in glider.conf cannot kill a running glider.
+	helpScheme  string
+	helpExample bool
 }
 
-func parseConfig() *Config {
+// parseConfig parses args (must include args[0] as the program name) into a
+// new Config. A fresh conflag instance is created on every call, so this is
+// safe to invoke at startup and again from a SIGHUP reload path.
+//
+// Errors are returned rather than terminating the process so that reload
+// failures can be logged while the existing config keeps serving traffic.
+// Note: conflag's underlying FlagSet still uses flag.ExitOnError, so a
+// malformed -flag in the config file can still kill the process on reload.
+func parseConfig(args []string) (*Config, error) {
 	conf := &Config{}
 
-	flag.SetOutput(os.Stdout)
+	f := conflag.New(args...)
+	// conflag defaults the underlying FlagSet to ExitOnError, which would
+	// kill the process on a bad flag during SIGHUP reload. Flip it to
+	// ContinueOnError so Parse returns an error we can recover from.
+	// FlagSet.Init only updates name + errorHandling; registered flags
+	// (including conflag's own "config"/"include") are preserved.
+	f.FlagSet.Init(f.FlagSet.Name(), flag.ContinueOnError)
+	f.SetOutput(os.Stdout)
 
-	scheme := flag.String("scheme", "", "show help message of proxy scheme, use 'all' to see all schemes")
-	example := flag.Bool("example", false, "show usage examples")
+	f.StringVar(&conf.helpScheme, "scheme", "", "show help message of proxy scheme, use 'all' to see all schemes")
+	f.BoolVar(&conf.helpExample, "example", false, "show usage examples")
 
-	flag.BoolVar(&conf.Verbose, "verbose", false, "verbose mode")
-	flag.IntVar(&conf.LogFlags, "logflags", 19, "do not change it if you do not know what it is, ref: https://pkg.go.dev/log#pkg-constants")
-	flag.IntVar(&conf.TCPBufSize, "tcpbufsize", 32768, "tcp buffer size in Bytes")
-	flag.IntVar(&conf.UDPBufSize, "udpbufsize", 2048, "udp buffer size in Bytes")
-	flag.StringSliceUniqVar(&conf.Listens, "listen", nil, "listen url, see the URL section below")
+	f.BoolVar(&conf.Verbose, "verbose", false, "verbose mode")
+	f.IntVar(&conf.LogFlags, "logflags", 19, "do not change it if you do not know what it is, ref: https://pkg.go.dev/log#pkg-constants")
+	f.IntVar(&conf.TCPBufSize, "tcpbufsize", 32768, "tcp buffer size in Bytes")
+	f.IntVar(&conf.UDPBufSize, "udpbufsize", 2048, "udp buffer size in Bytes")
+	f.StringSliceUniqVar(&conf.Listens, "listen", nil, "listen url, see the URL section below")
 
-	flag.StringSliceVar(&conf.Forwards, "forward", nil, "forward url, see the URL section below")
-	flag.StringVar(&conf.Strategy.Strategy, "strategy", "rr", `rr: Round Robin mode
+	f.StringSliceVar(&conf.Forwards, "forward", nil, "forward url, see the URL section below")
+	f.StringVar(&conf.Strategy.Strategy, "strategy", "rr", `rr: Round Robin mode
 ha: High Availability mode
 lha: Latency based High Availability mode
 dh: Destination Hashing mode`)
-	flag.StringVar(&conf.Strategy.Check, "check", "http://www.msftconnecttest.com/connecttest.txt#expect=200",
+	f.StringVar(&conf.Strategy.Check, "check", "http://www.msftconnecttest.com/connecttest.txt#expect=200",
 		`check=tcp[://HOST:PORT]: tcp port connect check
 check=http://HOST[:PORT][/URI][#expect=REGEX_MATCH_IN_RESP_LINE]
 check=https://HOST[:PORT][/URI][#expect=REGEX_MATCH_IN_RESP_LINE]
 check=file://SCRIPT_PATH: run a check script, healthy when exitcode=0, env vars: FORWARDER_ADDR,FORWARDER_URL
 check=disable: disable health check`)
-	flag.IntVar(&conf.Strategy.CheckInterval, "checkinterval", 30, "fowarder check interval(seconds)")
-	flag.IntVar(&conf.Strategy.CheckTimeout, "checktimeout", 10, "fowarder check timeout(seconds)")
-	flag.IntVar(&conf.Strategy.CheckTolerance, "checktolerance", 0, "fowarder check tolerance(ms), switch only when new_latency < old_latency - tolerance, only used in lha mode")
-	flag.IntVar(&conf.Strategy.CheckLatencySamples, "checklatencysamples", 10, "use the average latency of the latest N checks")
-	flag.BoolVar(&conf.Strategy.CheckDisabledOnly, "checkdisabledonly", false, "check disabled fowarders only")
-	flag.IntVar(&conf.Strategy.MaxFailures, "maxfailures", 3, "max failures to change forwarder status to disabled")
-	flag.IntVar(&conf.Strategy.DialTimeout, "dialtimeout", 3, "dial timeout(seconds)")
-	flag.IntVar(&conf.Strategy.RelayTimeout, "relaytimeout", 0, "relay timeout(seconds)")
-	flag.StringVar(&conf.Strategy.IntFace, "interface", "", "source ip or source interface")
+	f.IntVar(&conf.Strategy.CheckInterval, "checkinterval", 30, "fowarder check interval(seconds)")
+	f.IntVar(&conf.Strategy.CheckTimeout, "checktimeout", 10, "fowarder check timeout(seconds)")
+	f.IntVar(&conf.Strategy.CheckTolerance, "checktolerance", 0, "fowarder check tolerance(ms), switch only when new_latency < old_latency - tolerance, only used in lha mode")
+	f.IntVar(&conf.Strategy.CheckLatencySamples, "checklatencysamples", 10, "use the average latency of the latest N checks")
+	f.BoolVar(&conf.Strategy.CheckDisabledOnly, "checkdisabledonly", false, "check disabled fowarders only")
+	f.IntVar(&conf.Strategy.MaxFailures, "maxfailures", 3, "max failures to change forwarder status to disabled")
+	f.IntVar(&conf.Strategy.DialTimeout, "dialtimeout", 3, "dial timeout(seconds)")
+	f.IntVar(&conf.Strategy.RelayTimeout, "relaytimeout", 0, "relay timeout(seconds)")
+	f.StringVar(&conf.Strategy.IntFace, "interface", "", "source ip or source interface")
 
-	flag.StringSliceUniqVar(&conf.RuleFiles, "rulefile", nil, "rule file path")
-	flag.StringVar(&conf.RulesDir, "rules-dir", "", "rule file folder")
+	f.StringSliceUniqVar(&conf.RuleFiles, "rulefile", nil, "rule file path")
+	f.StringVar(&conf.RulesDir, "rules-dir", "", "rule file folder")
 
 	// dns configs
-	flag.StringVar(&conf.DNS, "dns", "", "local dns server listen address")
-	flag.StringSliceUniqVar(&conf.DNSConfig.Servers, "dnsserver", []string{"8.8.8.8:53"}, "remote dns server address")
-	flag.BoolVar(&conf.DNSConfig.AlwaysTCP, "dnsalwaystcp", false, "always use tcp to query upstream dns servers no matter there is a forwarder or not")
-	flag.IntVar(&conf.DNSConfig.Timeout, "dnstimeout", 3, "timeout value used in multiple dnsservers switch(seconds)")
-	flag.IntVar(&conf.DNSConfig.MaxTTL, "dnsmaxttl", 1800, "maximum TTL value for entries in the CACHE(seconds)")
-	flag.IntVar(&conf.DNSConfig.MinTTL, "dnsminttl", 0, "minimum TTL value for entries in the CACHE(seconds)")
-	flag.IntVar(&conf.DNSConfig.CacheSize, "dnscachesize", 4096, "max number of dns response in CACHE")
-	flag.BoolVar(&conf.DNSConfig.CacheLog, "dnscachelog", false, "show query log of dns cache")
-	flag.BoolVar(&conf.DNSConfig.NoAAAA, "dnsnoaaaa", false, "disable AAAA query")
-	flag.StringSliceUniqVar(&conf.DNSConfig.Records, "dnsrecord", nil, "custom dns record, format: domain/ip")
+	f.StringVar(&conf.DNS, "dns", "", "local dns server listen address")
+	f.StringSliceUniqVar(&conf.DNSConfig.Servers, "dnsserver", []string{"8.8.8.8:53"}, "remote dns server address")
+	f.BoolVar(&conf.DNSConfig.AlwaysTCP, "dnsalwaystcp", false, "always use tcp to query upstream dns servers no matter there is a forwarder or not")
+	f.IntVar(&conf.DNSConfig.Timeout, "dnstimeout", 3, "timeout value used in multiple dnsservers switch(seconds)")
+	f.IntVar(&conf.DNSConfig.MaxTTL, "dnsmaxttl", 1800, "maximum TTL value for entries in the CACHE(seconds)")
+	f.IntVar(&conf.DNSConfig.MinTTL, "dnsminttl", 0, "minimum TTL value for entries in the CACHE(seconds)")
+	f.IntVar(&conf.DNSConfig.CacheSize, "dnscachesize", 4096, "max number of dns response in CACHE")
+	f.BoolVar(&conf.DNSConfig.CacheLog, "dnscachelog", false, "show query log of dns cache")
+	f.BoolVar(&conf.DNSConfig.NoAAAA, "dnsnoaaaa", false, "disable AAAA query")
+	f.StringSliceUniqVar(&conf.DNSConfig.Records, "dnsrecord", nil, "custom dns record, format: domain/ip")
 
 	// service configs
-	flag.StringSliceUniqVar(&conf.Services, "service", nil, "run specified services, format: SERVICE_NAME[,SERVICE_CONFIG]")
+	f.StringSliceUniqVar(&conf.Services, "service", nil, "run specified services, format: SERVICE_NAME[,SERVICE_CONFIG]")
 
-	flag.Usage = usage
-	if err := flag.Parse(); err != nil {
-		// flag.Usage()
-		fmt.Fprintf(os.Stderr, "ERROR: %s\n", err)
-		os.Exit(-1)
+	f.Usage = func() {
+		fmt.Fprint(f.Output(), usage1)
+		f.PrintDefaults()
+		fmt.Fprintf(f.Output(), usage2, proxy.ServerSchemes(), proxy.DialerSchemes(), version)
+	}
+	if err := f.Parse(); err != nil {
+		return nil, err
 	}
 
-	if *scheme != "" {
-		fmt.Fprint(flag.Output(), proxy.Usage(*scheme))
-		os.Exit(0)
-	}
-
-	if *example {
-		fmt.Fprint(flag.Output(), examples)
-		os.Exit(0)
-	}
-
-	// setup logger
-	log.Set(conf.Verbose, conf.LogFlags)
+	// helpScheme / helpExample are honored only by the startup caller (main),
+	// not here. parseConfig never calls os.Exit so that a stray "scheme=" or
+	// "example=" line in a reloaded config cannot kill the running process.
 
 	if len(conf.Listens) == 0 && conf.DNS == "" && len(conf.Services) == 0 {
-		// flag.Usage()
-		fmt.Fprintf(os.Stderr, "ERROR: listen url must be specified.\n")
-		os.Exit(-1)
+		return nil, fmt.Errorf("listen url must be specified")
 	}
 
-	// tcpbufsize
+	if err := loadRules(conf, f.ConfDir()); err != nil {
+		return nil, err
+	}
+	return conf, nil
+}
+
+// applyGlobals pushes the Config-derived values that live in package-level
+// globals (logger verbosity, relay buffer sizes) into their destinations.
+// Kept out of parseConfig so a reload that fails after a successful parse
+// leaves the previous globals intact instead of half-applying new values.
+func applyGlobals(conf *Config) {
+	log.Set(conf.Verbose, conf.LogFlags)
 	if conf.TCPBufSize > 0 {
 		proxy.TCPBufSize = conf.TCPBufSize
 	}
-
-	// udpbufsize
 	if conf.UDPBufSize > 0 {
 		proxy.UDPBufSize = conf.UDPBufSize
 	}
-
-	loadRules(conf)
-	return conf
 }
 
-func loadRules(conf *Config) {
+func loadRules(conf *Config, confDir string) error {
 	// rulefiles
 	for _, ruleFile := range conf.RuleFiles {
 		if !path.IsAbs(ruleFile) {
-			ruleFile = path.Join(flag.ConfDir(), ruleFile)
+			ruleFile = path.Join(confDir, ruleFile)
 		}
 
-		rule, err := rule.NewConfFromFile(ruleFile)
+		r, err := rule.NewConfFromFile(ruleFile)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
-		conf.rules = append(conf.rules, rule)
+		conf.rules = append(conf.rules, r)
 	}
 
 	if conf.RulesDir != "" {
-		if !path.IsAbs(conf.RulesDir) {
-			conf.RulesDir = path.Join(flag.ConfDir(), conf.RulesDir)
+		rulesDir := conf.RulesDir
+		if !path.IsAbs(rulesDir) {
+			rulesDir = path.Join(confDir, rulesDir)
 		}
 
-		ruleFolderFiles, _ := rule.ListDir(conf.RulesDir, ".rule")
+		ruleFolderFiles, _ := rule.ListDir(rulesDir, ".rule")
 		for _, ruleFile := range ruleFolderFiles {
-			rule, err := rule.NewConfFromFile(ruleFile)
+			r, err := rule.NewConfFromFile(ruleFile)
 			if err != nil {
-				log.Fatal(err)
+				return err
 			}
-			conf.rules = append(conf.rules, rule)
+			conf.rules = append(conf.rules, r)
 		}
 	}
-}
-
-func usage() {
-	fmt.Fprint(flag.Output(), usage1)
-	flag.PrintDefaults()
-	fmt.Fprintf(flag.Output(), usage2, proxy.ServerSchemes(), proxy.DialerSchemes(), version)
+	return nil
 }
 
 var usage1 = `
@@ -224,31 +238,31 @@ var examples = `
 Examples:
   glider -config glider.conf
     -run glider with specified config file.
-  
+
   glider -listen :8443 -verbose
     -listen on :8443, serve as http/socks5 proxy on the same port, in verbose mode.
 
   glider -listen socks5://:1080 -listen http://:8080 -verbose
     -multiple listeners: listen on :1080 as socks5 proxy server, and on :8080 as http proxy server.
-  
+
   glider -listen :8443 -forward direct://#interface=eth0 -forward direct://#interface=eth1
     -multiple forwarders: listen on 8443 and forward requests via interface eth0 and eth1 in round robin mode.
-  
+
   glider -listen tls://:443?cert=crtFilePath&key=keyFilePath,http:// -verbose
     -protocol chain: listen on :443 as a https(http over tls) proxy server.
-  
+
   glider -listen http://:8080 -forward socks5://serverA:1080,socks5://serverB:1080
     -proxy chain: listen on :8080 as a http proxy server, forward all requests via forward chain.
-  
+
   glider -listen :8443 -forward socks5://serverA:1080 -forward socks5://serverB:1080#priority=10 -forward socks5://serverC:1080#priority=10
     -forwarder priority: serverA will only be used when serverB and serverC are not available.
-  
+
   glider -listen tcp://:80 -forward tcp://serverA:80
     -tcp tunnel: listen on :80 and forward all requests to serverA:80.
-  
+
   glider -listen udp://:53 -forward socks5://serverA:1080,udp://8.8.8.8:53
     -udp tunnel: listen on :53 and forward all udp requests to 8.8.8.8:53 via remote socks5 server.
-  
+
   glider -verbose -dns=:53 -dnsserver=8.8.8.8:53 -forward socks5://serverA:1080 -dnsrecord=abc.com/1.2.3.4
     -dns over proxy: listen on :53 as dns server, forward to 8.8.8.8:53 via socks5 server.
 `

@@ -1,6 +1,7 @@
 package rule
 
 import (
+	"flag"
 	"os"
 	"strings"
 
@@ -42,6 +43,10 @@ func NewConfFromFile(ruleFile string) (*Config, error) {
 	p := &Config{RulePath: ruleFile}
 
 	f := conflag.NewFromFile("rule", ruleFile)
+	// See config.go for rationale: switch FlagSet to ContinueOnError so a
+	// malformed rule file returns an error on SIGHUP reload instead of
+	// killing the process via os.Exit.
+	f.FlagSet.Init(f.FlagSet.Name(), flag.ContinueOnError)
 	f.StringSliceUniqVar(&p.Forward, "forward", nil, "forward url, format: SCHEME://[USER|METHOD:PASSWORD@][HOST]:PORT?PARAMS[,SCHEME://[USER|METHOD:PASSWORD@][HOST]:PORT?PARAMS]")
 	f.StringVar(&p.Strategy.Strategy, "strategy", "rr", "forward strategy, default: rr")
 	f.StringVar(&p.Strategy.Check, "check", "http://www.msftconnecttest.com/connecttest.txt#expect=200", "check=tcp[://HOST:PORT]: tcp port connect check\ncheck=http://HOST[:PORT][/URI][#expect=STRING_IN_RESP_LINE]\ncheck=file://SCRIPT_PATH: run a check script, healthy when exitcode=0, environment variables: FORWARDER_ADDR\ncheck=disable: disable health check")
