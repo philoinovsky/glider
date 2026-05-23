@@ -33,16 +33,23 @@ type FwdrGroup struct {
 	index    uint32
 	priority uint32
 	next     func(addr string) *Forwarder
+	// done is closed by stop() to signal all running check() goroutines
+	// (started by startCheckers / legacy Check) to exit. Created lazily in
+	// startCheckers; stop() is a no-op if checkers were never started.
+	done      chan struct{}
+	doneOnce  sync.Once
 }
 
-// NewFwdrGroup returns a new forward group.
-func NewFwdrGroup(rulePath string, s []string, c *Strategy) *FwdrGroup {
+// NewFwdrGroup returns a new forward group. Returns an error on malformed
+// forwarder URLs so the SIGHUP reload path can keep the existing config
+// alive instead of dying via log.Fatal.
+func NewFwdrGroup(rulePath string, s []string, c *Strategy) (*FwdrGroup, error) {
 	var fwdrs []*Forwarder
 	for _, chain := range s {
 		fwdr, err := ForwarderFromURL(chain, c.IntFace,
 			time.Duration(c.DialTimeout)*time.Second, time.Duration(c.RelayTimeout)*time.Second)
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 		fwdr.SetMaxFailures(uint32(c.MaxFailures))
 		fwdrs = append(fwdrs, fwdr)
@@ -53,14 +60,14 @@ func NewFwdrGroup(rulePath string, s []string, c *Strategy) *FwdrGroup {
 		direct, err := DirectForwarder(c.IntFace,
 			time.Duration(c.DialTimeout)*time.Second, time.Duration(c.RelayTimeout)*time.Second)
 		if err != nil {
-			log.Fatal(err)
+			return nil, err
 		}
 		fwdrs = append(fwdrs, direct)
 		c.Strategy = "rr"
 	}
 
 	name := strings.TrimSuffix(filepath.Base(rulePath), filepath.Ext(rulePath))
-	return newFwdrGroup(name, fwdrs, c)
+	return newFwdrGroup(name, fwdrs, c), nil
 }
 
 // newFwdrGroup returns a new FwdrGroup.
@@ -185,11 +192,14 @@ func (p *FwdrGroup) onStatusChanged(fwdr *Forwarder) {
 	}
 }
 
-// Check runs the forwarder checks.
-func (p *FwdrGroup) Check() {
+// buildChecker constructs the Checker described by p.config.Check, or
+// returns nil if checking is disabled (single forwarder, unparseable URL,
+// or unknown scheme). Logging is preserved in the disabled cases so
+// behavior matches the historical Check() entry point.
+func (p *FwdrGroup) buildChecker() Checker {
 	if len(p.fwdrs) == 1 {
 		log.F("[group] %s: only 1 forwarder found, disable health checking", p.name)
-		return
+		return nil
 	}
 
 	if !strings.Contains(p.config.Check, "://") {
@@ -199,7 +209,7 @@ func (p *FwdrGroup) Check() {
 	u, err := url.Parse(p.config.Check)
 	if err != nil {
 		log.F("[group] %s: parse check config error: %s, disable health checking", p.name, err)
-		return
+		return nil
 	}
 
 	addr := u.Host
@@ -220,14 +230,70 @@ func (p *FwdrGroup) Check() {
 		checker = newFileChecker(u.Host + u.Path)
 	default:
 		log.F("[group] %s: unknown scheme in check config `%s`, disable health checking", p.name, p.config.Check)
-		return
+		return nil
 	}
 
 	log.F("[group] %s: using check config: %s", p.name, p.config.Check)
+	return checker
+}
 
+// warmCheck runs one pass of the checker against every forwarder in the
+// group, concurrently, and waits for all results before returning. Used by
+// Proxy.Reload to bring a freshly-built FwdrGroup's forwarders from the
+// default DISABLED state to ENABLED before the new proxyState is published,
+// so the next Dial does not pick a forwarder whose health is still unknown.
+//
+// If checking is disabled for this group (buildChecker returns nil), every
+// forwarder is enabled unconditionally so single-forwarder/no-check groups
+// remain reachable. Errors from the checker keep the forwarder disabled;
+// the long-running checker started afterwards will retry on its schedule.
+func (p *FwdrGroup) warmCheck(wg *sync.WaitGroup) {
+	checker := p.buildChecker()
+	if checker == nil {
+		for _, f := range p.fwdrs {
+			f.Enable()
+		}
+		return
+	}
+	for i := range p.fwdrs {
+		wg.Add(1)
+		go func(fwdr *Forwarder) {
+			defer wg.Done()
+			elapsed, err := checker.Check(fwdr)
+			if err != nil {
+				log.F("[warmcheck] %s: %s(%d), FAILED. error: %s", p.name, fwdr.Addr(), fwdr.Priority(), err)
+				return
+			}
+			p.setLatency(fwdr, elapsed)
+			log.F("[warmcheck] %s: %s(%d), SUCCESS. Elapsed: %dms",
+				p.name, fwdr.Addr(), fwdr.Priority(), elapsed.Milliseconds())
+			fwdr.Enable()
+		}(p.fwdrs[i])
+	}
+}
+
+// startCheckers starts one long-running check goroutine per forwarder.
+// Each goroutine watches p.done and exits when it is closed, so a reload
+// that builds a new FwdrGroup can stop the old group's checkers and let
+// it (and the old proxyState) be garbage collected.
+func (p *FwdrGroup) startCheckers() {
+	checker := p.buildChecker()
+	if checker == nil {
+		return
+	}
+	p.done = make(chan struct{})
 	for i := range p.fwdrs {
 		go p.check(p.fwdrs[i], checker)
 	}
+}
+
+// stop signals all running check goroutines to exit. Safe to call on a
+// group whose checkers never started (no-op).
+func (p *FwdrGroup) stop() {
+	if p.done == nil {
+		return
+	}
+	p.doneOnce.Do(func() { close(p.done) })
 }
 
 func (p *FwdrGroup) check(fwdr *Forwarder, checker Checker) {
@@ -235,7 +301,23 @@ func (p *FwdrGroup) check(fwdr *Forwarder, checker Checker) {
 	intval := time.Duration(p.config.CheckInterval) * time.Second
 
 	for {
-		time.Sleep(intval * time.Duration(wait))
+		// Block until the next check interval or until stop() closes p.done.
+		// p.done is created in startCheckers before any goroutine is spawned,
+		// so it is non-nil here.
+		if d := intval * time.Duration(wait); d > 0 {
+			select {
+			case <-p.done:
+				return
+			case <-time.After(d):
+			}
+		} else {
+			// First iteration: no sleep, but still bail if stop() already fired.
+			select {
+			case <-p.done:
+				return
+			default:
+			}
+		}
 
 		// check all forwarders at least one time
 		if wait > 0 && (fwdr.Priority() < p.Priority()) {
