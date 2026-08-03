@@ -255,9 +255,11 @@ func TestDialBudgetStopsRetries(t *testing.T) {
 		dialers[i] = &fakeDialer{addr: string(rune('a' + i)), fail: true, delay: 40 * time.Millisecond}
 	}
 	// DialBudget is configured in seconds; set the resolved duration directly so
-	// the test does not have to burn a whole second.
+	// the test does not have to burn a whole second. 140ms fits three 40ms
+	// attempts by elapsed time alone, but the gate also demands room for another
+	// attempt as slow as the last, so it must stop earlier than that.
 	g := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: 5, MaxFailures: 99}, dialers...)
-	g.dialBudget = 50 * time.Millisecond
+	g.dialBudget = 140 * time.Millisecond
 
 	start := time.Now()
 	if _, _, err := g.Dial("tcp", "example.com:443"); err == nil {
@@ -269,8 +271,35 @@ func TestDialBudgetStopsRetries(t *testing.T) {
 	if n < 2 {
 		t.Errorf("total dials = %d, want at least 2: the first attempt always runs, and one retry fits in the budget", n)
 	}
-	if n == 5 {
-		t.Errorf("all %d attempts ran in %s; the wall-clock budget did not bound the retries", n, elapsed)
+	if n > 3 {
+		t.Errorf("%d attempts ran in %s under a %s budget; the wall-clock gate did not bound the retries", n, elapsed, g.dialBudget)
+	}
+}
+
+// The gate must leave room for another attempt as slow as the last one. A single
+// attempt that alone eats most of the budget must not license a second one that
+// carries the call past the caller's deadline — that is the whole point of the
+// budget, and checking elapsed time alone does not achieve it.
+func TestDialBudgetLeavesRoomForTheNextAttempt(t *testing.T) {
+	slow := &fakeDialer{addr: "slow", fail: true, delay: 90 * time.Millisecond}
+	b := &fakeDialer{addr: "b", fail: true}
+	c := &fakeDialer{addr: "c", fail: true}
+	g := newTestGroup(t, &Strategy{Strategy: "ha", DialAttempts: 3, MaxFailures: 99}, slow, b, c)
+	g.dialBudget = 100 * time.Millisecond // "ha" always starts on avail[0]
+
+	start := time.Now()
+	if _, _, err := g.Dial("tcp", "example.com:443"); err == nil {
+		t.Fatal("Dial: want failure")
+	}
+	elapsed := time.Since(start)
+
+	if slow.dials.Load() != 1 {
+		t.Fatalf("the slow forwarder was dialed %d times, want 1 (%v)", slow.dials.Load(), dialCounts(slow, b, c))
+	}
+	// 90ms elapsed is under the 100ms budget, so an elapsed-only gate would have
+	// started another attempt.
+	if n := totalDials(slow, b, c); n != 1 {
+		t.Errorf("%d attempts in %s: a 90ms failure under a 100ms budget must not license a retry that could take another 90ms", n, elapsed)
 	}
 }
 
@@ -350,6 +379,72 @@ func TestStatusReportsRotationSize(t *testing.T) {
 	// Total counts configured forwarders, so a disabled one is still listed.
 	if len(st.Forwarders) != 3 {
 		t.Errorf("Status().Forwarders = %d entries, want all 3 listed", len(st.Forwarders))
+	}
+}
+
+// Enable/Disable run their handlers AFTER the CAS that flipped the flag, so a
+// late handler can arrive while the forwarder is (again) enabled and already in
+// the rotation. That is what an interleaved Disable/Enable looks like from
+// onStatusChanged's point of view, and it must not duplicate the entry: a
+// duplicate skews round robin, lets a "retry on a different forwarder" land on
+// the same one, and makes Status() report enabled > total.
+func TestStatusChangeDoesNotDuplicateAvailEntry(t *testing.T) {
+	a := &fakeDialer{addr: "a", fail: true}
+	b := &fakeDialer{addr: "b"}
+	g := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: 3, MaxFailures: 99}, a, b)
+
+	f := fwdr(t, g, "a")
+	// f is enabled and in avail; deliver the callback a raced Disable would have
+	// delivered late, once its Enable had already put the flag back.
+	g.onStatusChanged(f)
+	g.onStatusChanged(f)
+
+	if st := g.Status(); st.Enabled != 2 || st.Total != 2 {
+		t.Fatalf("Status() = %d of %d, want 2 of 2 (a duplicated rotation entry)", st.Enabled, st.Total)
+	}
+
+	// And a retry must still move to the other forwarder rather than re-dialing
+	// the duplicated one.
+	conn, _, err := g.Dial("tcp", "example.com:443")
+	if err != nil {
+		t.Fatalf("Dial: %v (dials %v)", err, dialCounts(a, b))
+	}
+	conn.Close()
+	if a.dials.Load() > 1 {
+		t.Errorf("forwarder %q dialed %d times; the retry re-used a duplicated rotation entry", a.addr, a.dials.Load())
+	}
+}
+
+// A fat-fingered dialattempts must not be used as a slice capacity.
+func TestDialAttemptsClampedToPoolSize(t *testing.T) {
+	a := &fakeDialer{addr: "a", fail: true}
+	b := &fakeDialer{addr: "b", fail: true}
+	g := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: 1 << 40, MaxFailures: 99}, a, b)
+
+	cands := g.dialCandidates("example.com:443", g.dialAttempts)
+	if len(cands) != 2 || cap(cands) != 2 {
+		t.Errorf("candidates len=%d cap=%d, want 2/2: attempts must be clamped to the pool size", len(cands), cap(cands))
+	}
+	if _, _, err := g.Dial("tcp", "example.com:443"); err == nil {
+		t.Fatal("Dial: want failure")
+	}
+	if got := totalDials(a, b); got != 2 {
+		t.Errorf("total dials = %d, want 2", got)
+	}
+}
+
+// A budget big enough to overflow the conversion to time.Duration must not wrap
+// negative and silently read as "no clock bound".
+func TestDialBudgetOverflowClamped(t *testing.T) {
+	a := &fakeDialer{addr: "a"}
+	g := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: 2, DialBudget: 1 << 40}, a)
+	if g.dialBudget <= 0 {
+		t.Errorf("dialBudget = %v, want a positive clamped duration", g.dialBudget)
+	}
+
+	g2 := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: 2, DialBudget: -5}, a)
+	if g2.dialBudget != 0 {
+		t.Errorf("dialBudget = %v for a negative config, want 0 (no clock bound)", g2.dialBudget)
 	}
 }
 

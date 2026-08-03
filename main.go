@@ -118,11 +118,19 @@ func main() {
 		r.IP, r.CIDR, r.Domain = nil, nil, nil
 	}
 
-	// Read-only status endpoint. Bound before the proxy listeners so a bad
-	// admin address is a startup error rather than a lost signal, and passed
-	// pxy.Status as a func so it keeps reporting the live routing state across
-	// SIGHUP reloads.
+	// Read-only status endpoint. Bound before the proxy listeners so a bad admin
+	// address is a startup error rather than a lost signal — a monitoring
+	// endpoint that silently isn't there is worse than one that refuses to
+	// start. pxy.Status is passed as a func so it keeps reporting the live
+	// routing state across SIGHUP reloads.
+	//
+	// The listen-collision check runs here rather than in parseConfig because
+	// admin= is bind-time: reload warns about it and ignores it, so it must not
+	// be able to reject a config and abort an otherwise valid routing reload.
 	if config.Admin != "" {
+		if err := checkAdminAddr(config.Admin, config.Listens); err != nil {
+			log.Fatal(err)
+		}
 		a, err := admin.New(config.Admin, pxy.Status)
 		if err != nil {
 			log.Fatal(err)

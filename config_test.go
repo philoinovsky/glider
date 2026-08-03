@@ -14,8 +14,15 @@ func TestListenHostPort(t *testing.T) {
 		{in: "socks5://user:pa@ss@1.2.3.4:1080", host: "1.2.3.4", port: "1080", ok: true},
 		{in: "tls://:443?cert=/x/y.pem&key=/x/y.key,http://", host: "", port: "443", ok: true},
 		{in: "mixed://[::1]:1080", host: "::1", port: "1080", ok: true},
+		// A path-bearing listener still binds its host:port.
+		{in: "ws://127.0.0.1:1090/path", host: "127.0.0.1", port: "1090", ok: true},
+		// Non-TCP listeners can share a port number with the TCP admin endpoint.
+		{in: "udp://:1090", ok: false},
+		{in: "kcp://:1090", ok: false},
+		{in: "vsock://:1090", ok: false},
 		// Unrecognized shapes report false so the caller skips rather than guesses.
 		{in: "unix:///var/run/glider.sock", ok: false},
+		{in: "http://127.0.0.1:notaport", ok: false},
 		{in: "", ok: false},
 	}
 	for _, c := range cases {
@@ -46,6 +53,13 @@ func TestCheckAdminAddr(t *testing.T) {
 		{name: "different host same port", admin: "10.0.0.5:1080", listens: []string{"http://127.0.0.1:1080"}},
 		{name: "chained listen", admin: "443", listens: []string{"tls://:443?cert=c&key=k,http://"}, wantErr: true},
 		{name: "invalid admin addr", admin: "not-a-port", listens: []string{":1080"}, wantErr: true},
+		// Same port number, different transport: not a collision. Rejecting these
+		// would refuse a config that works.
+		{name: "udp listener same port", admin: "1090", listens: []string{"udp://:1090"}},
+		{name: "kcp listener same port", admin: "1090", listens: []string{"kcp://:1090"}},
+		{name: "vsock listener same port", admin: "1090", listens: []string{"vsock://:1090"}},
+		// A path-bearing TCP listener is still a collision.
+		{name: "ws listener with path", admin: "1090", listens: []string{"ws://127.0.0.1:1090/path"}, wantErr: true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

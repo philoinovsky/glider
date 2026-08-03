@@ -115,16 +115,20 @@ func (f *Forwarder) URL() string {
 
 // Dial dials to addr and returns conn.
 //
-// This is the single place a dial failure is charged to a forwarder's health,
-// and it already covers every path that reaches an upstream: FwdrGroup.Dial —
-// including each of its retries, since every attempt is made through the
-// forwarder it lands on, so a request that succeeds on a retry still charges the
-// forwarder that failed — and the health checkers in check.go.
+// It charges a failed dial to the forwarder's own health counter. Every TCP
+// attempt reaches an upstream through here — FwdrGroup.Dial (including each of
+// its retries, since every attempt is made through the forwarder it lands on,
+// so a request that succeeds on a retry still charges the forwarder that
+// failed) and the health checkers in check.go.
 //
-// Servers must therefore NOT also call Proxy.Record(dialer, false) when Dial
-// returns an error. Record is IncFailures, so doing both would count one failure
-// twice and disable forwarders at half the configured maxfailures. Record is for
-// the relay phase, which this method cannot observe.
+// So a server must NOT also call Proxy.Record(dialer, false) on a dial error:
+// Record is IncFailures, and doing both counts one failure twice, disabling
+// forwarders at half the configured maxfailures. Record is for the relay phase,
+// which this method cannot observe. The http and socks5 servers get this right;
+// tcp/tls/ws/kcp/smux/vsock/unix and the DNS client still double-count their
+// dial errors, and UDP is the opposite — FwdrGroup.DialUDP calls the embedded
+// DialUDP directly, so UDP dial failures are not counted at all. Both are
+// pre-existing and untouched here; see the PR body.
 func (f *Forwarder) Dial(network, addr string) (c net.Conn, err error) {
 	c, err = f.Dialer.Dial(network, addr)
 	if err != nil {

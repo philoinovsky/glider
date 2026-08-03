@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 
 	"github.com/nadoo/conflag"
@@ -139,24 +140,33 @@ check=disable: disable health check`)
 		return nil, fmt.Errorf("listen url must be specified")
 	}
 
-	if conf.Admin != "" {
-		if err := checkAdminAddr(conf.Admin, conf.Listens); err != nil {
-			return nil, err
-		}
-	}
-
 	if err := loadRules(conf, f.ConfDir()); err != nil {
 		return nil, err
 	}
 	return conf, nil
 }
 
+// nonTCPListenSchemes are listen schemes that do not take a TCP port, so they
+// can share a port number with the admin endpoint without colliding.
+var nonTCPListenSchemes = map[string]bool{
+	"udp": true, "kcp": true, "unix": true, "vsock": true,
+}
+
 // checkAdminAddr validates the admin address and rejects one that would collide
-// with a proxy listener.
+// with a TCP proxy listener.
 //
-// The kernel would catch the collision anyway, but as an EADDRINUSE on whichever
-// of the two listeners loses the race — a confusing way to learn that `admin=`
-// was pointed at the same port as `listen=`. Failing here names both sides.
+// The kernel would catch a real collision anyway, but as a log.Fatal on
+// whichever of the two listeners loses the race — a confusing way to learn that
+// `admin=` was pointed at a `listen=` port. Failing here names both sides.
+//
+// It is deliberately called from startup only, NOT from parseConfig: `admin=` is
+// bind-time (SIGHUP warns instead of rebinding), so letting this reject a config
+// on reload would abort an otherwise valid routing reload over a field the
+// reload does not even apply.
+//
+// Skew is one-sided on purpose. A form we cannot parse, or a non-TCP listener,
+// is passed over rather than guessed at — a missed collision still fails loudly
+// at bind time, whereas a false positive would refuse a config that works.
 func checkAdminAddr(adminAddr string, listens []string) error {
 	hostport, err := admin.NormalizeAddr(adminAddr)
 	if err != nil {
@@ -180,20 +190,29 @@ func checkAdminAddr(adminAddr string, listens []string) error {
 	return nil
 }
 
-// listenHostPort extracts the host:port a `-listen` URL binds. It reports false
-// for a form it does not recognize, so the caller skips the collision check
-// rather than guessing at it — a missed collision still surfaces as a bind error.
+// listenHostPort extracts the TCP host:port a `-listen` URL binds. It reports
+// false for a non-TCP listener or a form it does not recognize.
 func listenHostPort(s string) (host, port string, ok bool) {
 	s, _, _ = strings.Cut(s, ",") // protocol chain: only the first element binds
 	s, _, _ = strings.Cut(s, "?") // strip query params (cert=, key=, ...)
-	if _, rest, found := strings.Cut(s, "://"); found {
+	if scheme, rest, found := strings.Cut(s, "://"); found {
+		if nonTCPListenSchemes[strings.ToLower(scheme)] {
+			return "", "", false
+		}
 		s = rest
 	}
 	if i := strings.LastIndex(s, "@"); i >= 0 {
 		s = s[i+1:] // strip userinfo (last '@': a password may contain one)
 	}
+	s, _, _ = strings.Cut(s, "/") // strip a path (ws://host:port/path)
+
 	host, port, err := net.SplitHostPort(s)
 	if err != nil {
+		return "", "", false
+	}
+	// SplitHostPort does not validate the port, and a non-numeric one means we
+	// misparsed rather than that we found a collision.
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 		return "", "", false
 	}
 	return host, port, true
