@@ -114,6 +114,17 @@ func (f *Forwarder) URL() string {
 }
 
 // Dial dials to addr and returns conn.
+//
+// This is the single place a dial failure is charged to a forwarder's health,
+// and it already covers every path that reaches an upstream: FwdrGroup.Dial —
+// including each of its retries, since every attempt is made through the
+// forwarder it lands on, so a request that succeeds on a retry still charges the
+// forwarder that failed — and the health checkers in check.go.
+//
+// Servers must therefore NOT also call Proxy.Record(dialer, false) when Dial
+// returns an error. Record is IncFailures, so doing both would count one failure
+// twice and disable forwarders at half the configured maxfailures. Record is for
+// the relay phase, which this method cannot observe.
 func (f *Forwarder) Dial(network, addr string) (c net.Conn, err error) {
 	c, err = f.Dialer.Dial(network, addr)
 	if err != nil {

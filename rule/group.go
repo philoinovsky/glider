@@ -16,6 +16,18 @@ import (
 	"github.com/nadoo/glider/proxy"
 )
 
+const (
+	// DefaultDialAttempts is how many forwarders one Dial may try. 3 keeps the
+	// worst case cheap while still collapsing an independent per-forwarder
+	// failure rate p to roughly p^3.
+	DefaultDialAttempts = 3
+	// DefaultDialBudget (seconds) caps the wall clock spent on retries. It is
+	// deliberately below the dial timeout of the clients in front of glider
+	// (Torii uses 10s): overshooting it would replace a fast 502 with a slow
+	// timeout, which is strictly worse for the caller.
+	DefaultDialBudget = 8
+)
+
 // forwarder slice orderd by priority.
 type priSlice []*Forwarder
 
@@ -36,8 +48,13 @@ type FwdrGroup struct {
 	// done is closed by stop() to signal all running check() goroutines
 	// (started by startCheckers / legacy Check) to exit. Created lazily in
 	// startCheckers; stop() is a no-op if checkers were never started.
-	done      chan struct{}
-	doneOnce  sync.Once
+	done     chan struct{}
+	doneOnce sync.Once
+
+	// Dial retry bounds, resolved once from config so the hot path does no
+	// unit conversion and tests can drive the clock bound directly.
+	dialAttempts int
+	dialBudget   time.Duration
 }
 
 // NewFwdrGroup returns a new forward group. Returns an error on malformed
@@ -72,7 +89,13 @@ func NewFwdrGroup(rulePath string, s []string, c *Strategy) (*FwdrGroup, error) 
 
 // newFwdrGroup returns a new FwdrGroup.
 func newFwdrGroup(name string, fwdrs []*Forwarder, c *Strategy) *FwdrGroup {
-	p := &FwdrGroup{name: name, fwdrs: fwdrs, config: c}
+	p := &FwdrGroup{
+		name:         name,
+		fwdrs:        fwdrs,
+		config:       c,
+		dialAttempts: max(c.DialAttempts, 1),
+		dialBudget:   time.Duration(c.DialBudget) * time.Second,
+	}
 	sort.Sort(p.fwdrs)
 
 	p.init()
@@ -109,10 +132,59 @@ func newFwdrGroup(name string, fwdrs []*Forwarder, c *Strategy) *FwdrGroup {
 }
 
 // Dial connects to the address addr on the network net.
+//
+// A failed dial is retried on a *different* forwarder instead of being handed
+// straight back to the caller. With dozens of enabled forwarders in the
+// rotation, one flaky upstream should not become a 502 downstream — the
+// exchange-facing failure mode we actually observe is a per-forwarder dial
+// failure (anytls SYNACK timeout, TCP i/o timeout, EOF), not a whole-group
+// outage.
+//
+// The retry is bounded twice, because either bound alone is insufficient:
+//   - Strategy.DialAttempts caps how many forwarders one Dial may burn, so a
+//     group-wide outage can't turn a single CONNECT into len(fwdrs) dials.
+//   - Strategy.DialBudget caps the wall clock. Per-attempt cost is not
+//     controlled by dialtimeout alone (anytls has its own 3s SYNACK timeout),
+//     so without a clock bound the retries could stack past the downstream
+//     client's own dial deadline and trade 502s for timeouts.
+//
+// The first attempt always runs, so a group configured with attempts=1 (or a
+// zero budget) behaves exactly as it did before retries existed.
+//
+// Health accounting is unchanged and needs no extra bookkeeping here: each
+// attempt goes through Forwarder.Dial, which charges the failure to that
+// forwarder's own counter. Retrying therefore makes the health signal stronger,
+// not weaker — the flaky forwarder still walks toward maxfailures while the
+// request is served by a healthy one.
 func (p *FwdrGroup) Dial(network, addr string) (net.Conn, proxy.Dialer, error) {
-	nd := p.NextDialer(addr)
-	c, err := nd.Dial(network, addr)
-	return c, nd, err
+	cands := p.dialCandidates(addr, p.dialAttempts)
+	start := time.Now()
+
+	var lastDialer proxy.Dialer
+	var lastErr error
+	for i, nd := range cands {
+		if i > 0 && p.dialBudget > 0 && time.Since(start) >= p.dialBudget {
+			log.F("[group] %s: %s, dial budget %s spent after %d attempt(s), giving up", p.name, addr, p.dialBudget, i)
+			break
+		}
+
+		c, err := nd.Dial(network, addr)
+		if err == nil {
+			if i > 0 {
+				log.F("[group] %s: %s, dial succeeded via %s on attempt %d", p.name, addr, nd.Addr(), i+1)
+			}
+			return c, nd, nil
+		}
+
+		// Logged per attempt so the per-forwarder dial failure reasons stay
+		// visible: the servers only log the final error, and without this a
+		// successful retry would hide the failure that preceded it.
+		log.F("[group] %s: %s, dial via %s failed (attempt %d/%d): %s",
+			p.name, addr, nd.Addr(), i+1, len(cands), err)
+		lastDialer, lastErr = nd, err
+	}
+
+	return nil, lastDialer, lastErr
 }
 
 // DialUDP connects to the given address.
@@ -127,11 +199,68 @@ func (p *FwdrGroup) NextDialer(dstAddr string) proxy.Dialer {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	return p.nextDialer(dstAddr)
+}
+
+// nextDialer picks one forwarder according to the group's strategy, falling
+// back to round-robin over the full set when nothing is known-available.
+// Callers must hold p.mu (read lock is enough; the schedulers only read p.avail
+// and bump p.index atomically).
+func (p *FwdrGroup) nextDialer(dstAddr string) *Forwarder {
 	if len(p.avail) == 0 {
 		return p.fwdrs[atomic.AddUint32(&p.index, 1)%uint32(len(p.fwdrs))]
 	}
 
 	return p.next(dstAddr)
+}
+
+// dialCandidates returns up to n distinct forwarders to try for one Dial, in
+// the order they should be tried.
+//
+// The first entry is whatever the group's strategy picks, so the forwarder a
+// non-retrying dial would have used is still the one that gets first refusal.
+// The retries then walk the available set from there and skip the first pick —
+// which is the only way ha/dh/lha, whose choice is deterministic for a given
+// destination, can yield a *different* forwarder on retry.
+//
+// The whole list is taken under one read lock. p.avail is rewritten wholesale
+// by onStatusChanged/init, so re-picking per attempt would either need the lock
+// per attempt or race on the slice. A forwarder that is disabled mid-retry is
+// still tried: that is no worse than the pre-retry behavior (which could hand
+// out a forwarder disabled a moment later), and the next Dial won't see it.
+func (p *FwdrGroup) dialCandidates(dstAddr string, n int) []*Forwarder {
+	n = max(n, 1)
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	first := p.nextDialer(dstAddr)
+	out := make([]*Forwarder, 0, n)
+	out = append(out, first)
+
+	// Retries rotate through the available forwarders; when nothing is available
+	// nextDialer already fell back to the full set, so match it here.
+	pool := p.avail
+	if len(pool) == 0 {
+		pool = p.fwdrs
+	}
+
+	// Start just past the first pick so retries move away from it rather than
+	// re-walking the head of the slice on every Dial.
+	start := 0
+	for i, f := range pool {
+		if f == first {
+			start = i + 1
+			break
+		}
+	}
+	for i := 0; i < len(pool) && len(out) < n; i++ {
+		if f := pool[(start+i)%len(pool)]; f != first {
+			out = append(out, f)
+		}
+	}
+
+	return out
 }
 
 // Priority returns the active priority of dialer.

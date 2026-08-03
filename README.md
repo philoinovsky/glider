@@ -37,6 +37,12 @@ we can set up local listeners as proxy servers, and forward requests to internet
   - add resolved ips for domains from rule files by dns forwarding server
 - Serve http and socks5 on the same port
 - Periodical availability checking for forwarders
+- Dial retry: a failed dial moves on to the next forwarder instead of failing the
+  request, bounded by `dialattempts` (how many forwarders) and `dialbudget`
+  (wall clock). Each failed attempt is still counted against the forwarder it
+  happened on, so `maxfailures` reflects real traffic and not just the periodic check
+- Read-only status endpoint (`admin=`): per-group forwarders enabled vs
+  configured, as Prometheus text on `/metrics` and JSON on `/state`
 - Send requests from specific local ip/interface
 - Services: 
   - dhcpd: a simple dhcp server that can run in failover mode
@@ -109,6 +115,8 @@ Usage: glider [-listen URL]... [-forward URL]... [OPTION]...
        glider -listen :8443 -forward socks5://serverA:1080 -forward socks5://serverB:1080 -verbose
 
 OPTION:
+  -admin string
+        listen address of the read-only status endpoint (/metrics, /state, /healthz); a bare port binds 127.0.0.1, empty disables
   -check string
         check=tcp[://HOST:PORT]: tcp port connect check
         check=http://HOST[:PORT][/URI][#expect=REGEX_MATCH_IN_RESP_LINE]
@@ -127,6 +135,10 @@ OPTION:
         fowarder check tolerance(ms), switch only when new_latency < old_latency - tolerance, only used in lha mode
   -config string
         config file path
+  -dialattempts int
+        max forwarders to try for one dial, a failed dial retries on the next forwarder (default 3)
+  -dialbudget int
+        wall-clock budget for dial retries(seconds), 0 to bound by dialattempts only; keep it below the downstream client's dial timeout (default 8)
   -dialtimeout int
         dial timeout(seconds) (default 3)
   -dns string
