@@ -143,15 +143,18 @@ func renderPrometheus(groups []rule.GroupStatus) string {
 	// password or SNI. A repeated label set makes Prometheus reject the whole
 	// scrape, which would silently remove the very signal this endpoint exists
 	// to serve — so collisions are disambiguated rather than emitted as-is.
-	groupNames, fwdrKeys := newUniquer(), newUniquer()
+	groupNames := newUniquer()
 
 	for _, g := range groups {
 		gl := label("group", groupNames.take(g.Group))
 		gauge(&b, "glider_group_forwarders_enabled", "{"+gl+"}", float64(g.Enabled))
 		gauge(&b, "glider_group_forwarders_total", "{"+gl+"}", float64(g.Total))
 
+		// Addresses only have to be unique within their group, since the group
+		// label is already unique.
+		addrs := newUniquer()
 		for _, f := range g.Forwarders {
-			fl := "{" + gl + "," + label("addr", fwdrKeys.take(gl+"\x00"+f.Addr, f.Addr)) + "}"
+			fl := "{" + gl + "," + label("addr", addrs.take(f.Addr)) + "}"
 			gauge(&b, "glider_forwarder_enabled", fl, boolVal(f.Enabled))
 			gauge(&b, "glider_forwarder_failures", fl, float64(f.Failures))
 			gauge(&b, "glider_forwarder_latency_ms", fl, float64(f.LatencyMs))
@@ -160,26 +163,30 @@ func renderPrometheus(groups []rule.GroupStatus) string {
 	return b.String()
 }
 
-// uniquer hands out label values that are unique within one rendering, suffixing
-// a repeat with "#n" rather than emitting a duplicate series.
-type uniquer map[string]int
+// uniquer hands out label values that are unique within one rendering.
+type uniquer map[string]bool
 
 func newUniquer() uniquer { return uniquer{} }
 
-// take returns value (or value#n on a repeat). The identity is keyed on key,
-// which defaults to value; pass a separate key when the same value is legitimate
-// under two different parents.
-func (u uniquer) take(key string, value ...string) string {
-	v := key
-	if len(value) > 0 {
-		v = value[0]
-	}
-	n := u[key]
-	u[key] = n + 1
-	if n == 0 {
+// take returns v, or the first "v#n" not already emitted, and reserves the
+// result.
+//
+// Reserving the *output* is the point: counting repeats of the input is not
+// enough, because a generated name can collide with a real one. Group names are
+// rule-file basenames and '#' is a legal filename character, so the inputs
+// `cn`, `cn`, `cn#1` would otherwise emit `cn#1` twice — the very duplicate this
+// is here to prevent.
+func (u uniquer) take(v string) string {
+	if !u[v] {
+		u[v] = true
 		return v
 	}
-	return fmt.Sprintf("%s#%d", v, n)
+	for n := 1; ; n++ {
+		if cand := fmt.Sprintf("%s#%d", v, n); !u[cand] {
+			u[cand] = true
+			return cand
+		}
+	}
 }
 
 func help(b *strings.Builder, name, typ, desc string) {

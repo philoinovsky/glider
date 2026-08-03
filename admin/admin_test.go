@@ -191,8 +191,49 @@ func TestPrometheusSeriesAreUnique(t *testing.T) {
 			{Group: "cn", Enabled: 1, Total: 1}, // same basename, different directory
 		}
 	}
-	body := serve(t, status, http.MethodGet, "/metrics").Body.String()
+	assertNoDuplicateSeries(t, serve(t, status, http.MethodGet, "/metrics").Body.String())
 
+	// The un-collided values must still render plainly.
+	body := serve(t, status, http.MethodGet, "/metrics").Body.String()
+	if !strings.Contains(body, `glider_group_forwarders_enabled{group="cn"} 1`) {
+		t.Errorf("first group was renamed:\n%s", body)
+	}
+}
+
+// Counting repeats of the input is not enough: a generated name can collide
+// with a real one. Group names are rule-file basenames and '#' is a legal
+// filename character, so `cn`, `cn`, `cn#1` is a reachable configuration and
+// naive suffixing emits `cn#1` twice.
+func TestPrometheusSuffixDoesNotCollideWithARealName(t *testing.T) {
+	status := func() []rule.GroupStatus {
+		return []rule.GroupStatus{
+			{Group: "cn", Enabled: 1, Total: 1},
+			{Group: "cn", Enabled: 2, Total: 2},
+			{Group: "cn#1", Enabled: 3, Total: 3},
+		}
+	}
+	assertNoDuplicateSeries(t, serve(t, status, http.MethodGet, "/metrics").Body.String())
+}
+
+func TestUniquerReservesItsOwnOutput(t *testing.T) {
+	u := newUniquer()
+	got := []string{u.take("cn"), u.take("cn"), u.take("cn#1"), u.take("cn")}
+	seen := map[string]bool{}
+	for _, g := range got {
+		if seen[g] {
+			t.Errorf("take returned %q twice: %v", g, got)
+		}
+		seen[g] = true
+	}
+	if got[0] != "cn" {
+		t.Errorf("first take = %q, want the value unchanged", got[0])
+	}
+}
+
+// assertNoDuplicateSeries fails if any metric line repeats a name+label set,
+// which makes Prometheus reject the entire scrape.
+func assertNoDuplicateSeries(t *testing.T, body string) {
+	t.Helper()
 	seen := map[string]bool{}
 	for _, line := range strings.Split(body, "\n") {
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -203,10 +244,6 @@ func TestPrometheusSeriesAreUnique(t *testing.T) {
 			t.Errorf("duplicate series %q in:\n%s", series, body)
 		}
 		seen[series] = true
-	}
-	// The un-collided values must still render plainly.
-	if !strings.Contains(body, `glider_group_forwarders_enabled{group="cn"} 1`) {
-		t.Errorf("first group was renamed:\n%s", body)
 	}
 }
 
