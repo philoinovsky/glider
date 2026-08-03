@@ -177,6 +177,39 @@ func TestNewFailsOnBusyAddress(t *testing.T) {
 	}
 }
 
+// A duplicated label set makes Prometheus reject the whole scrape, so neither a
+// repeated group name (two rule files in different directories share a
+// basename) nor a repeated forwarder address (two forwarders differing only by
+// password or SNI) may emit the same series twice.
+func TestPrometheusSeriesAreUnique(t *testing.T) {
+	status := func() []rule.GroupStatus {
+		return []rule.GroupStatus{
+			{Group: "cn", Enabled: 1, Total: 2, Forwarders: []rule.ForwarderStatus{
+				{Addr: "1.2.3.4:443", Enabled: true},
+				{Addr: "1.2.3.4:443", Enabled: false}, // same host:port, different password
+			}},
+			{Group: "cn", Enabled: 1, Total: 1}, // same basename, different directory
+		}
+	}
+	body := serve(t, status, http.MethodGet, "/metrics").Body.String()
+
+	seen := map[string]bool{}
+	for _, line := range strings.Split(body, "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		series := line[:strings.LastIndex(line, " ")]
+		if seen[series] {
+			t.Errorf("duplicate series %q in:\n%s", series, body)
+		}
+		seen[series] = true
+	}
+	// The un-collided values must still render plainly.
+	if !strings.Contains(body, `glider_group_forwarders_enabled{group="cn"} 1`) {
+		t.Errorf("first group was renamed:\n%s", body)
+	}
+}
+
 // Label values reach the exposition format verbatim, so a quote or backslash in
 // a group name (rule files are operator-named) must not break the output.
 func TestPrometheusEscapesLabels(t *testing.T) {

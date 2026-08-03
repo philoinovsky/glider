@@ -20,6 +20,8 @@ func TestListenHostPort(t *testing.T) {
 		{in: "udp://:1090", ok: false},
 		{in: "kcp://:1090", ok: false},
 		{in: "vsock://:1090", ok: false},
+		// tproxy only starts its UDP side; its TCP mode logs "not supported".
+		{in: "tproxy://:1090", ok: false},
 		// Unrecognized shapes report false so the caller skips rather than guesses.
 		{in: "unix:///var/run/glider.sock", ok: false},
 		{in: "http://127.0.0.1:notaport", ok: false},
@@ -58,6 +60,7 @@ func TestCheckAdminAddr(t *testing.T) {
 		{name: "udp listener same port", admin: "1090", listens: []string{"udp://:1090"}},
 		{name: "kcp listener same port", admin: "1090", listens: []string{"kcp://:1090"}},
 		{name: "vsock listener same port", admin: "1090", listens: []string{"vsock://:1090"}},
+		{name: "tproxy listener same port", admin: "1090", listens: []string{"tproxy://:1090"}},
 		// A path-bearing TCP listener is still a collision.
 		{name: "ws listener with path", admin: "1090", listens: []string{"ws://127.0.0.1:1090/path"}, wantErr: true},
 	}

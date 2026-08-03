@@ -3,6 +3,7 @@ package rule
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -415,11 +416,13 @@ func TestStatusChangeDoesNotDuplicateAvailEntry(t *testing.T) {
 	}
 }
 
-// A fat-fingered dialattempts must not be used as a slice capacity.
+// A fat-fingered dialattempts must not be used as a slice capacity. math.MaxInt
+// rather than a fixed shift: an untyped constant that overflows int would not
+// compile on the 32-bit targets in glider's build matrix.
 func TestDialAttemptsClampedToPoolSize(t *testing.T) {
 	a := &fakeDialer{addr: "a", fail: true}
 	b := &fakeDialer{addr: "b", fail: true}
-	g := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: 1 << 40, MaxFailures: 99}, a, b)
+	g := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: math.MaxInt, MaxFailures: 99}, a, b)
 
 	cands := g.dialCandidates("example.com:443", g.dialAttempts)
 	if len(cands) != 2 || cap(cands) != 2 {
@@ -434,10 +437,12 @@ func TestDialAttemptsClampedToPoolSize(t *testing.T) {
 }
 
 // A budget big enough to overflow the conversion to time.Duration must not wrap
-// negative and silently read as "no clock bound".
+// negative and silently read as "no clock bound". math.MaxInt keeps this
+// compiling on the 32-bit targets in glider's build matrix (where the
+// multiplication cannot actually overflow, but the clamp still has to hold).
 func TestDialBudgetOverflowClamped(t *testing.T) {
 	a := &fakeDialer{addr: "a"}
-	g := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: 2, DialBudget: 1 << 40}, a)
+	g := newTestGroup(t, &Strategy{Strategy: "rr", DialAttempts: 2, DialBudget: math.MaxInt}, a)
 	if g.dialBudget <= 0 {
 		t.Errorf("dialBudget = %v, want a positive clamped duration", g.dialBudget)
 	}

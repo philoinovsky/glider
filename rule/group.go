@@ -167,6 +167,14 @@ func newFwdrGroup(name string, fwdrs []*Forwarder, c *Strategy) *FwdrGroup {
 // A first attempt that hangs is untouched by any of this; it hung before
 // retries existed too.
 //
+// The last attempt's cost is a predictor, not a guarantee, and it is wrong in
+// both directions: after a 1ms failure an arbitrarily slow attempt is still
+// admitted, and after a slow one a retry that would have fit can be refused.
+// That is accepted — the observed failures are homogeneous (a 3s anytls SYNACK
+// timeout, a 3s TCP timeout, an instant EOF), so the previous attempt is a good
+// estimate of the next, and erring toward a fast 502 over a slow timeout is the
+// deliberate direction.
+//
 // The first attempt always runs, so a group configured with attempts=1 (or a
 // zero budget) behaves exactly as it did before retries existed.
 //

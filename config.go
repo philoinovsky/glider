@@ -147,9 +147,12 @@ check=disable: disable health check`)
 }
 
 // nonTCPListenSchemes are listen schemes that do not take a TCP port, so they
-// can share a port number with the admin endpoint without colliding.
+// can share a port number with the admin endpoint without colliding. `tproxy`
+// belongs here: its ListenAndServe only starts the UDP side and its TCP mode
+// logs "not supported now". Schemes that serve both (ss, socks5) do bind TCP
+// and are deliberately absent.
 var nonTCPListenSchemes = map[string]bool{
-	"udp": true, "kcp": true, "unix": true, "vsock": true,
+	"udp": true, "kcp": true, "unix": true, "vsock": true, "tproxy": true,
 }
 
 // checkAdminAddr validates the admin address and rejects one that would collide
