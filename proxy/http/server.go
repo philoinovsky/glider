@@ -86,6 +86,9 @@ func (s *HTTP) servHTTPS(r *request, c net.Conn) {
 	rc, dialer, err := s.proxy.Dial("tcp", r.uri)
 	if err != nil {
 		io.WriteString(c, r.proto+" 502 ERROR\r\n\r\n")
+		// No Record(dialer, false) here on purpose: rule.Forwarder.Dial has
+		// already charged this failure (and each retried attempt's) to the
+		// forwarder it happened on. Recording again would double-count it.
 		log.F("[http] %s <-> %s [c] via %s, error in dial: %v", c.RemoteAddr(), r.uri, dialer.Addr(), err)
 		return
 	}

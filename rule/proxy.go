@@ -261,4 +261,3 @@ func (p *Proxy) AddDomainIP(domain string, ip netip.Addr) error {
 	}
 	return nil
 }
-

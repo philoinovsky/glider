@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nadoo/glider/admin"
 	"github.com/nadoo/glider/dns"
 	"github.com/nadoo/glider/ipset"
 	"github.com/nadoo/glider/pkg/log"
@@ -117,6 +118,26 @@ func main() {
 		r.IP, r.CIDR, r.Domain = nil, nil, nil
 	}
 
+	// Read-only status endpoint. Bound before the proxy listeners so a bad admin
+	// address is a startup error rather than a lost signal — a monitoring
+	// endpoint that silently isn't there is worse than one that refuses to
+	// start. pxy.Status is passed as a func so it keeps reporting the live
+	// routing state across SIGHUP reloads.
+	//
+	// The listen-collision check runs here rather than in parseConfig because
+	// admin= is bind-time: reload warns about it and ignores it, so it must not
+	// be able to reject a config and abort an otherwise valid routing reload.
+	if config.Admin != "" {
+		if err := checkAdminAddr(config.Admin, config.Listens); err != nil {
+			log.Fatal(err)
+		}
+		a, err := admin.New(config.Admin, pxy.Status)
+		if err != nil {
+			log.Fatal(err)
+		}
+		go a.Serve()
+	}
+
 	// run proxy servers
 	for _, listen := range config.Listens {
 		local, err := proxy.ServerFromURL(listen, pxy)
@@ -184,13 +205,13 @@ func reload(pxy *rule.Proxy) {
 		len(newCfg.Forwards), len(newCfg.rules))
 }
 
-
 // bindSnapshot captures the fields that are baked in at process start
 // (sockets bound, DNS server started, services launched) and therefore
 // cannot be reloaded by SIGHUP. reload() uses warnDiff to surface these
 // changes to the operator without affecting routing reload itself.
 type bindSnapshot struct {
 	listens  []string
+	admin    string
 	dns      string
 	services []string
 	dnsCfg   dns.Config
@@ -199,6 +220,7 @@ type bindSnapshot struct {
 func newBindSnapshot(c *Config) bindSnapshot {
 	return bindSnapshot{
 		listens:  append([]string(nil), c.Listens...),
+		admin:    c.Admin,
 		dns:      c.DNS,
 		services: append([]string(nil), c.Services...),
 		dnsCfg:   c.DNSConfig,
@@ -213,6 +235,9 @@ func newBindSnapshot(c *Config) bindSnapshot {
 func (b bindSnapshot) warnDiff(c *Config) {
 	if !stringSliceEqual(b.listens, c.Listens) {
 		log.F("[main] listen= changed; reload refreshes routes only, restart required to rebind listeners")
+	}
+	if b.admin != c.Admin {
+		log.F("[main] admin= changed; reload does not rebind the status endpoint, restart required")
 	}
 	if b.dns != c.DNS {
 		log.F("[main] dns= changed; reload does not restart the DNS server, restart required")

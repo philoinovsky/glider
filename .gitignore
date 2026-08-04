@@ -24,7 +24,9 @@
 /dev/
 dev*.go
 
-*_test.go
+# Upstream ignores *_test.go wholesale. This fork tracks tests for the code it
+# adds (dial retry, forwarder status endpoint), which has no upstream regression
+# net of its own.
 
 dist
 

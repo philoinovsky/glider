@@ -36,6 +36,12 @@ type Strategy struct {
 	DialTimeout         int
 	RelayTimeout        int
 	IntFace             string
+
+	// DialAttempts is how many forwarders one Dial may try before it gives up,
+	// and DialBudget (seconds; 0 = no clock bound) caps the wall clock those
+	// retries may spend. See FwdrGroup.Dial for why both bounds are needed.
+	DialAttempts int
+	DialBudget   int
 }
 
 // NewConfFromFile returns a new config from file.
@@ -58,6 +64,8 @@ func NewConfFromFile(ruleFile string) (*Config, error) {
 	f.IntVar(&p.Strategy.MaxFailures, "maxfailures", 3, "max failures to change forwarder status to disabled")
 	f.IntVar(&p.Strategy.DialTimeout, "dialtimeout", 3, "dial timeout(seconds)")
 	f.IntVar(&p.Strategy.RelayTimeout, "relaytimeout", 0, "relay timeout(seconds)")
+	f.IntVar(&p.Strategy.DialAttempts, "dialattempts", DefaultDialAttempts, "max forwarders to try for one dial, a failed dial retries on the next forwarder")
+	f.IntVar(&p.Strategy.DialBudget, "dialbudget", DefaultDialBudget, "wall-clock budget for dial retries(seconds), 0 to bound by dialattempts only; keep it below the downstream client's dial timeout")
 	f.StringVar(&p.Strategy.IntFace, "interface", "", "source ip or source interface")
 
 	f.StringSliceUniqVar(&p.DNSServers, "dnsserver", nil, "remote dns server")

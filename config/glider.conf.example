@@ -26,6 +26,17 @@
 # Verbose mode, print logs
 verbose=True
 
+# STATUS ENDPOINT
+# ---------------
+# Read-only HTTP endpoint reporting how many forwarders are in each group's dial
+# rotation, for scraping (Prometheus text on /metrics, JSON on /state, liveness
+# on /healthz). It exposes forwarder addresses but never forwarder URLs, which
+# carry upstream credentials.
+#
+# A bare or host-less port binds 127.0.0.1 — unlike listen=, which binds every
+# interface — and it must not reuse a listen= port. Empty (the default) disables it.
+# admin=1090
+
 # LISTENERS
 # ---------
 # Local listeners, we can set up multiple listeners on different port with
@@ -184,6 +195,16 @@ maxfailures=3
 
 # timeout for create a connection(seconds)
 # dialtimeout=3
+
+# A failed dial is retried on the NEXT forwarder rather than failing the request,
+# so one flaky upstream in a large pool does not surface downstream. Each failed
+# attempt is still counted against the forwarder it happened on (maxfailures).
+# dialattempts: how many forwarders one dial may try; 1 disables retrying.
+# dialbudget: wall-clock ceiling for the retries(seconds), 0 = bound by
+#   dialattempts only. Keep it BELOW the dial timeout of whatever calls glider —
+#   retries that overshoot it just trade a fast error for a slow timeout.
+# dialattempts=3
+# dialbudget=8
 
 # timeout for relay data from proxy server and client(seconds)
 # DO NOT change it if you don't know what will happen. 

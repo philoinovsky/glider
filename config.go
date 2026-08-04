@@ -3,11 +3,15 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path"
+	"strconv"
+	"strings"
 
 	"github.com/nadoo/conflag"
 
+	"github.com/nadoo/glider/admin"
 	"github.com/nadoo/glider/dns"
 	"github.com/nadoo/glider/pkg/log"
 	"github.com/nadoo/glider/proxy"
@@ -22,6 +26,10 @@ type Config struct {
 	UDPBufSize int
 
 	Listens []string
+
+	// Admin is the address of the read-only status endpoint ("" disables it).
+	// Bind-time like Listens: SIGHUP reload warns instead of rebinding it.
+	Admin string
 
 	Forwards []string
 	Strategy rule.Strategy
@@ -72,6 +80,7 @@ func parseConfig(args []string) (*Config, error) {
 	f.IntVar(&conf.TCPBufSize, "tcpbufsize", 32768, "tcp buffer size in Bytes")
 	f.IntVar(&conf.UDPBufSize, "udpbufsize", 2048, "udp buffer size in Bytes")
 	f.StringSliceUniqVar(&conf.Listens, "listen", nil, "listen url, see the URL section below")
+	f.StringVar(&conf.Admin, "admin", "", "listen address of the read-only status endpoint (/metrics, /state, /healthz); a bare port binds 127.0.0.1, empty disables")
 
 	f.StringSliceVar(&conf.Forwards, "forward", nil, "forward url, see the URL section below")
 	f.StringVar(&conf.Strategy.Strategy, "strategy", "rr", `rr: Round Robin mode
@@ -92,6 +101,8 @@ check=disable: disable health check`)
 	f.IntVar(&conf.Strategy.MaxFailures, "maxfailures", 3, "max failures to change forwarder status to disabled")
 	f.IntVar(&conf.Strategy.DialTimeout, "dialtimeout", 3, "dial timeout(seconds)")
 	f.IntVar(&conf.Strategy.RelayTimeout, "relaytimeout", 0, "relay timeout(seconds)")
+	f.IntVar(&conf.Strategy.DialAttempts, "dialattempts", rule.DefaultDialAttempts, "max forwarders to try for one dial, a failed dial retries on the next forwarder")
+	f.IntVar(&conf.Strategy.DialBudget, "dialbudget", rule.DefaultDialBudget, "wall-clock budget for dial retries(seconds), 0 to bound by dialattempts only; keep it below the downstream client's dial timeout")
 	f.StringVar(&conf.Strategy.IntFace, "interface", "", "source ip or source interface")
 
 	f.StringSliceUniqVar(&conf.RuleFiles, "rulefile", nil, "rule file path")
@@ -133,6 +144,86 @@ check=disable: disable health check`)
 		return nil, err
 	}
 	return conf, nil
+}
+
+// nonTCPListenSchemes are listen schemes that do not take a TCP port, so they
+// can share a port number with the admin endpoint without colliding. `tproxy`
+// belongs here: its ListenAndServe only starts the UDP side and its TCP mode
+// logs "not supported now". Schemes that serve both (ss, socks5) do bind TCP
+// and are deliberately absent.
+var nonTCPListenSchemes = map[string]bool{
+	"udp": true, "kcp": true, "unix": true, "vsock": true, "tproxy": true,
+}
+
+// checkAdminAddr validates the admin address and rejects one that would collide
+// with a TCP proxy listener.
+//
+// The kernel would catch a real collision anyway, but as a log.Fatal on
+// whichever of the two listeners loses the race — a confusing way to learn that
+// `admin=` was pointed at a `listen=` port. Failing here names both sides.
+//
+// It is deliberately called from startup only, NOT from parseConfig: `admin=` is
+// bind-time (SIGHUP warns instead of rebinding), so letting this reject a config
+// on reload would abort an otherwise valid routing reload over a field the
+// reload does not even apply.
+//
+// Skew is one-sided on purpose. A form we cannot parse, or a non-TCP listener,
+// is passed over rather than guessed at — a missed collision still fails loudly
+// at bind time, whereas a false positive would refuse a config that works.
+func checkAdminAddr(adminAddr string, listens []string) error {
+	hostport, err := admin.NormalizeAddr(adminAddr)
+	if err != nil {
+		return err
+	}
+	aHost, aPort, err := net.SplitHostPort(hostport)
+	if err != nil {
+		return fmt.Errorf("admin: %q is not a valid address", adminAddr)
+	}
+
+	for _, l := range listens {
+		lHost, lPort, ok := listenHostPort(l)
+		if !ok || lPort != aPort {
+			continue
+		}
+		// A wildcard bind on either side covers the other's address.
+		if wildcardHost(lHost) || wildcardHost(aHost) || lHost == aHost {
+			return fmt.Errorf("admin address %s collides with listen %q; give the admin endpoint its own port", hostport, l)
+		}
+	}
+	return nil
+}
+
+// listenHostPort extracts the TCP host:port a `-listen` URL binds. It reports
+// false for a non-TCP listener or a form it does not recognize.
+func listenHostPort(s string) (host, port string, ok bool) {
+	s, _, _ = strings.Cut(s, ",") // protocol chain: only the first element binds
+	s, _, _ = strings.Cut(s, "?") // strip query params (cert=, key=, ...)
+	if scheme, rest, found := strings.Cut(s, "://"); found {
+		if nonTCPListenSchemes[strings.ToLower(scheme)] {
+			return "", "", false
+		}
+		s = rest
+	}
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		s = s[i+1:] // strip userinfo (last '@': a password may contain one)
+	}
+	s, _, _ = strings.Cut(s, "/") // strip a path (ws://host:port/path)
+
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return "", "", false
+	}
+	// SplitHostPort does not validate the port, and a non-numeric one means we
+	// misparsed rather than that we found a collision.
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+		return "", "", false
+	}
+	return host, port, true
+}
+
+// wildcardHost reports whether host binds every interface.
+func wildcardHost(host string) bool {
+	return host == "" || host == "0.0.0.0" || host == "::"
 }
 
 // applyGlobals pushes the Config-derived values that live in package-level
