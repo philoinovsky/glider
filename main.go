@@ -114,6 +114,12 @@ func main() {
 		}
 	}
 
+	// Health checks resolve forwarder hosts through the resolver above, so they
+	// start only now: checked earlier, a host known only to a rule dnsserver or
+	// a dnsrecord failed on the system resolver and stayed DISABLED until the
+	// next checkinterval.
+	pxy.Start()
+
 	for _, r := range config.rules {
 		r.IP, r.CIDR, r.Domain = nil, nil, nil
 	}
