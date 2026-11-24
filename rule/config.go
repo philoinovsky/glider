@@ -68,7 +68,7 @@ func NewConfFromFile(ruleFile string) (*Config, error) {
 	f.IntVar(&p.Strategy.DialBudget, "dialbudget", DefaultDialBudget, "wall-clock budget for dial retries(seconds), 0 to bound by dialattempts only; keep it below the downstream client's dial timeout")
 	f.StringVar(&p.Strategy.IntFace, "interface", "", "source ip or source interface")
 
-	f.StringSliceUniqVar(&p.DNSServers, "dnsserver", nil, "remote dns server")
+	f.StringSliceUniqVar(&p.DNSServers, "dnsserver", nil, "remote dns server, udp/tcp HOST[:PORT] or DoH [https://]HOST[:PORT]/PATH")
 	f.StringVar(&p.IPSet, "ipset", "", "ipset NAME, will create 2 sets: NAME for ipv4 and NAME6 for ipv6")
 
 	f.StringSliceVar(&p.Domain, "domain", nil, "domain")

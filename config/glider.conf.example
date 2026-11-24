@@ -250,6 +250,10 @@ checkdisabledonly=false
 dnsserver=8.8.8.8:53
 dnsserver=1.1.1.1:53
 
+# a server with a path is DNS over HTTPS (RFC 8484, POST). Its host is resolved
+# with /etc/hosts and /etc/resolv.conf, never through glider's own dns server.
+# dnsserver=https://dns.google/dns-query
+
 # By default, when glider received udp dns request and there's no forwarder specified, 
 # it will use udp to query upstream dns servers, otherwise, use tcp;
 # you can set dnsalwaystcp=true to always use tcp no matter there is a forwarder or not.

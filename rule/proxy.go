@@ -37,20 +37,26 @@ type proxyState struct {
 // URLs so callers can decide whether to abort (startup) or keep an older
 // state alive (SIGHUP reload).
 //
-// Forwarders start in the DISABLED state (see forward.go); NewProxy runs a
-// synchronous warmCheck so the first Dial does not pick an unverified
-// forwarder, then starts long-running health checkers. Callers must not
-// also invoke Check() — this used to be required and is now a no-op.
+// Forwarders start in the DISABLED state (see forward.go) and nothing checks
+// them until Start. The proxy can already route, so the dns server that the
+// health checks resolve forwarder hosts through can run before Start.
 func NewProxy(mainForwarders []string, mainStrategy *Strategy, rules []*Config) (*Proxy, error) {
 	state, err := buildState(mainForwarders, mainStrategy, rules)
 	if err != nil {
 		return nil, err
 	}
-	state.warmCheck()
 	p := &Proxy{}
 	p.state.Store(state)
-	state.startCheckers()
 	return p, nil
+}
+
+// Start runs a synchronous warmCheck so the first Dial from a listener does
+// not pick an unverified forwarder, then starts the long-running health
+// checkers. Call it exactly once, before serving any listener.
+func (p *Proxy) Start() {
+	state := p.state.Load()
+	state.warmCheck()
+	state.startCheckers()
 }
 
 // Reload atomically swaps the routing state with one built from the given

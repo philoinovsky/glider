@@ -1,6 +1,8 @@
 package dns
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -8,6 +10,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nadoo/glider/pkg/log"
@@ -39,6 +42,11 @@ type Client struct {
 	upStream    *UPStream
 	upStreamMap map[string]*UPStream
 	handlers    []AnswerHandler
+
+	// DoH state, see doh.go.
+	dohClients   sync.Map // dialer Addr() -> *http.Client
+	dohBootstrap func(ctx context.Context, host string) ([]netip.Addr, error)
+	dohTLS       *tls.Config
 }
 
 // NewClient returns a new dns client.
@@ -49,6 +57,8 @@ func NewClient(proxy proxy.Proxy, config *Config) (*Client, error) {
 		config:      config,
 		upStream:    NewUPStream(config.Servers),
 		upStreamMap: make(map[string]*UPStream),
+
+		dohBootstrap: systemLookup,
 	}
 
 	// custom records
@@ -180,6 +190,18 @@ func (c *Client) exchange(qname string, reqBytes []byte, preferTCP bool) (
 	ups := c.UpStream(qname)
 	server = ups.Server()
 	for range ups.Len() {
+		if isDoH(server) {
+			if respBytes, err = c.exchangeDoH(dialer, server, reqBytes); err == nil {
+				network = "doh"
+				break
+			}
+			newServer := ups.SwitchIf(server)
+			log.F("[dns] error in resolving %s, failed to exchange with server %v via %s: %v, next server: %s",
+				qname, server, dialer.Addr(), err, newServer)
+			server = newServer
+			continue
+		}
+
 		var rc net.Conn
 		rc, err = dialer.Dial(network, server)
 		if err != nil {

@@ -158,7 +158,7 @@ OPTION:
   -dnsrecord value
         custom dns record, format: domain/ip
   -dnsserver value
-        remote dns server address
+        remote dns server address, udp/tcp HOST[:PORT] or DoH [https://]HOST[:PORT]/PATH
   -dnstimeout int
         timeout value used in multiple dnsservers switch(seconds) (default 3)
   -example
